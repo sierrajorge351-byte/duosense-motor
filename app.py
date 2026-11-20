@@ -41,7 +41,7 @@ st.markdown("""
 <div class="ds-hero"><div class="ds-kicker">Proyecto final · Machine Learning</div>
 <h1>DuoSense</h1><p>Explora la salud de un rodamiento con vibración y corriente del motor.</p></div>
 """, unsafe_allow_html=True)
-st.caption("Prototipo académico · datos experimentales Paderborn · aplicación local en tu computador")
+st.caption("Prototipo académico · datos experimentales Paderborn · aplicación web pública")
 
 with st.sidebar:
     st.header("Ajustes de la prueba")

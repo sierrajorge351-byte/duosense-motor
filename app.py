@@ -61,9 +61,13 @@ st.sidebar.markdown("## ⚡ ElectroPV")
 st.sidebar.caption("Diagnóstico de fallas en un sistema solar conectado a la red")
 page=st.sidebar.radio("Ir a",["Inicio","Probar 6 paneles","Evaluar modelos","Probar mis CSV","Entender el proyecto"],label_visibility="collapsed")
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Datos cargados**")
-st.sidebar.write("16 experimentos reales · 8 estados · 2 modos")
-st.sidebar.caption("Fuente: GPVS-Faults · Mendeley Data · CC BY 4.0")
+st.sidebar.markdown("**Datos disponibles**")
+if page=="Probar 6 paneles":
+    st.sidebar.write("6 paneles físicos · 18 pruebas")
+    st.sidebar.caption("Fuente: Mismatching PV Modules · Mendeley Data · CC BY 4.0")
+else:
+    st.sidebar.write("16 experimentos · 8 estados · 2 modos")
+    st.sidebar.caption("Fuente: GPVS-Faults · Mendeley Data · CC BY 4.0")
 
 if page=="Inicio":
     st.markdown("<div class='hero'><h1>ElectroPV</h1><p>Una aplicación para explorar señales eléctricas reales y comparar dos formas de encontrar fallas en sistemas fotovoltaicos.</p></div>",unsafe_allow_html=True)

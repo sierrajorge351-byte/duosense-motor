@@ -21,6 +21,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data" / "csv_pruebas"
+PANEL_DATA_DIR = ROOT / "data" / "panel_cases"
 ARTIFACT_DIR = ROOT / "artifacts"
 WINDOW = 1024
 CHANNELS = ["Ipv", "Vpv", "Vdc", "ia", "ib", "ic", "va", "vb", "vc", "Iabc", "If", "Vabc", "Vf"]
@@ -32,6 +33,7 @@ FAULTS = {0: "Normal", 1: "Falla en el arreglo fotovoltaico", 2: "Falla en el in
           7: "Falla del convertidor elevador (boost)"}
 FAULTS_ES = {0: "Normal", 1: "Arreglo fotovoltaico", 2: "Inversor", 3: "Red eléctrica",
              4: "Sensor de realimentación", 5: "Conexión a red", 6: "Control MPPT", 7: "Convertidor boost"}
+PANEL_CONDITIONS = ["Limpio", "Sucio", "Sombreado"]
 
 
 def feature_columns(modality: str) -> list[str]:
@@ -52,6 +54,83 @@ def load_builtin() -> pd.DataFrame:
     if not frames:
         raise FileNotFoundError("No se encontraron los 16 CSV de demostración.")
     return pd.concat(frames, ignore_index=True)
+
+
+def load_panel_cases() -> pd.DataFrame:
+    files=sorted(PANEL_DATA_DIR.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError("No se encontraron los CSV de los seis paneles.")
+    return pd.concat([pd.read_csv(p) for p in files],ignore_index=True)
+
+
+def panel_feature_columns(modality: str) -> list[str]:
+    stats=("media","rms","desv","min","max","curtosis")
+    electrical=[f"{s}_{t}" for s in ("corriente","voltaje","potencia") for t in stats]+["irradiancia","temperatura_modulo"]
+    thermal=["temp_media","temp_desv","temp_max","temp_p95"]
+    cols=electrical+thermal
+    if modality=="Eléctricas": return electrical
+    if modality=="Térmica": return thermal
+    return cols
+
+
+def panel_case_table(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    return df.groupby(["panel_id","modelo","condicion"],as_index=False)[cols].mean()
+
+
+def evaluate_panels_supervised(df: pd.DataFrame, modality: str) -> dict:
+    from sklearn.base import clone
+    cols=panel_feature_columns(modality)
+    if not cols: raise ValueError("No hay características para esa modalidad.")
+    models={
+        "Árbol de decisión":DecisionTreeClassifier(max_depth=10,class_weight="balanced",random_state=42),
+        "Random Forest":RandomForestClassifier(n_estimators=180,max_features="sqrt",class_weight="balanced_subsample",random_state=42,n_jobs=-1),
+        "Regresión logística":make_pipeline(StandardScaler(),LogisticRegression(max_iter=1000,class_weight="balanced",random_state=42))
+    }
+    scores=[]; details={}; labels=PANEL_CONDITIONS
+    for name,base in models.items():
+        predictions=[]
+        for held_panel in sorted(df["panel_id"].unique()):
+            train=df[df["panel_id"]!=held_panel]; test=df[df["panel_id"]==held_panel]
+            model=clone(base); model.fit(train[cols].replace([np.inf,-np.inf],np.nan).fillna(0),train["condicion"])
+            test=test.copy(); test["_pred"]=model.predict(test[cols].replace([np.inf,-np.inf],np.nan).fillna(0))
+            for (pid,mod,cond),grp in test.groupby(["panel_id","modelo","condicion"]):
+                guess=grp["_pred"].mode().iloc[0]
+                predictions.append({"panel_id":pid,"modelo":mod,"real":cond,"predicho":guess,"ventanas":len(grp)})
+        pred=pd.DataFrame(predictions)
+        scores.append({"Modelo":name,"Exactitud":accuracy_score(pred["real"],pred["predicho"]),
+                       "Exactitud balanceada":balanced_accuracy_score(pred["real"],pred["predicho"]),
+                       "F1 macro":f1_score(pred["real"],pred["predicho"],labels=labels,average="macro",zero_division=0)})
+        details[name]=pred
+    table=pd.DataFrame(scores); best=table.sort_values("F1 macro",ascending=False).iloc[0]["Modelo"]
+    bestpred=details[best]
+    cm=confusion_matrix(bestpred["real"],bestpred["predicho"],labels=labels)
+    return {"tabla":table,"best":best,"predictions":bestpred,"confusion":cm,"labels":labels,"cols":cols}
+
+
+def evaluate_panels_unsupervised(df: pd.DataFrame, modality: str) -> dict:
+    cols=panel_feature_columns(modality)
+    cases=panel_case_table(df,cols)
+    x=cases[cols].replace([np.inf,-np.inf],np.nan).fillna(0)
+    scaler=StandardScaler(); xs=scaler.fit_transform(x)
+    k=3; km=KMeans(n_clusters=k,random_state=42,n_init=10); cluster=km.fit_predict(xs)
+    sil=silhouette_score(xs,cluster) if len(np.unique(cluster))>1 else float("nan")
+    ari=adjusted_rand_score(cases["condicion"],cluster)
+    xy=PCA(n_components=2,random_state=42).fit_transform(xs)
+    plot=cases[["panel_id","modelo","condicion"]].copy()
+    plot["Componente 1"]=xy[:,0]; plot["Componente 2"]=xy[:,1]; plot["Grupo K-means"]=cluster.astype(str)
+    mapping=plot.groupby("Grupo K-means")["condicion"].agg(lambda s:s.mode().iloc[0]).rename("Condición más común después de comparar").reset_index()
+    variance=float(PCA(n_components=2,random_state=42).fit(xs).explained_variance_ratio_.sum())
+    return {"cases":cases,"plot":plot,"mapping":mapping,"silhouette":float(sil),"ari":float(ari),"pca_variance":variance,"model":km,"scaler":scaler}
+
+
+def save_panel_experiment(metadata: dict, metrics: pd.DataFrame) -> Path:
+    import json
+    ARTIFACT_DIR.mkdir(parents=True,exist_ok=True)
+    stamp=time.strftime("%Y%m%d_%H%M%S")
+    payload={**metadata,"metricas_supervisadas":metrics.to_dict(orient="records")}
+    out=ARTIFACT_DIR/f"paneles_{stamp}.json"
+    out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    return out
 
 
 def raw_to_features(raw: pd.DataFrame, filename: str = "archivo.csv") -> pd.DataFrame:

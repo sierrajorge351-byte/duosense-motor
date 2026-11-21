@@ -12,7 +12,10 @@ import streamlit as st
 
 from ml_core import (ARTIFACT_DIR, DATA_DIR, FAULTS_ES, evaluate_supervised,
                      evaluate_unsupervised, feature_columns, load_builtin,
-                     read_uploaded_csv, save_experiment)
+                     read_uploaded_csv, save_experiment, load_panel_cases,
+                     panel_feature_columns, panel_case_table,
+                     evaluate_panels_supervised, evaluate_panels_unsupervised,
+                     save_panel_experiment)
 
 st.set_page_config(page_title="ElectroPV | Diagnóstico inteligente", page_icon="⚡", layout="wide",
                    initial_sidebar_state="expanded")
@@ -39,6 +42,10 @@ LABEL_OPTIONS = [f"{k} · {v}" for k,v in FAULT_NAMES.items()]
 def get_data():
     return load_builtin()
 
+@st.cache_data(show_spinner="Cargando las pruebas de seis paneles…")
+def get_panel_data():
+    return load_panel_cases()
+
 def dataset_zip() -> bytes:
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
@@ -52,7 +59,7 @@ def label_names(values):
 df_all=get_data()
 st.sidebar.markdown("## ⚡ ElectroPV")
 st.sidebar.caption("Diagnóstico de fallas en un sistema solar conectado a la red")
-page=st.sidebar.radio("Ir a",["Inicio","Evaluar modelos","Probar mis CSV","Entender el proyecto","Sustentación"],label_visibility="collapsed")
+page=st.sidebar.radio("Ir a",["Inicio","Probar 6 paneles","Evaluar modelos","Probar mis CSV","Entender el proyecto"],label_visibility="collapsed")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Datos cargados**")
 st.sidebar.write("16 experimentos reales · 8 estados · 2 modos")
@@ -80,9 +87,62 @@ if page=="Inicio":
         st.write("Puedes analizar corriente, voltaje o ambos juntos. Así ves si combinar modalidades ayuda a reconocer las fallas en estas pruebas.")
         st.markdown("#### 4 · Prueba CSV propios")
         st.write("Carga uno o varios CSV. Cada archivo se procesa de forma independiente y la aplicación muestra la predicción por fragmento y el resumen del caso.")
-    st.info("Empieza en **Evaluar modelos** para ejecutar la comparación incluida. Para probar un archivo individual, abre **Probar mis CSV**.")
+    st.info("Para las pruebas con paneles físicos diferentes, abre **Probar 6 paneles**. Los 16 CSV de GPVS se conservan como un conjunto adicional de demostración.")
     st.download_button("Descargar los 16 CSV de prueba",data=dataset_zip(),file_name="ElectroPV_CSV_reales_16_experimentos.zip",mime="application/zip",use_container_width=True)
     st.caption("Los archivos descargables contienen características calculadas a partir de las señales reales. Para descargar las señales originales completas, visita la fuente Mendeley citada en la guía.")
+
+elif page=="Probar 6 paneles":
+    st.title("Pruebas con seis paneles fotovoltaicos")
+    st.write("Aquí puedes probar **cada panel físico por separado**. Hay seis muestras físicas, de dos modelos distintos. Cada una tiene tres condiciones: limpia, sucia y sombreada. Son 18 archivos CSV independientes.")
+    panels=get_panel_data()
+    c1,c2,c3=st.columns(3)
+    c1.metric("Paneles físicos", "6")
+    c2.metric("Pruebas panel + condición", "18")
+    c3.metric("Fragmentos medidos", f"{len(panels):,}")
+    modality=st.selectbox("Qué mediciones usar",["Eléctricas + térmicas","Eléctricas","Térmica"],help="Eléctricas: corriente y voltaje; térmica: temperatura de la superficie; ambas: usa las dos fuentes.")
+    cols=panel_feature_columns(modality)
+    cases=panel_case_table(panels,cols)
+    st.markdown("### Los 18 archivos listos para probar")
+    table=cases[["panel_id","modelo","condicion"]].drop_duplicates().rename(columns={"panel_id":"Panel físico","modelo":"Modelo de panel","condicion":"Condición"})
+    st.dataframe(table,use_container_width=True,hide_index=True)
+    panel_opts=sorted(panels["panel_id"].unique())
+    chosen=st.selectbox("Elige un panel",panel_opts)
+    cond=st.selectbox("Elige la prueba",["Limpio","Sucio","Sombreado"])
+    one=panels[(panels.panel_id==chosen)&(panels.condicion==cond)]
+    if not one.empty:
+        st.download_button("Descargar solo esta prueba CSV",one.to_csv(index=False).encode("utf-8-sig"),file_name=f"{chosen}_{cond}.csv",mime="text/csv")
+    buf=io.BytesIO()
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        from pathlib import Path
+        for p in sorted((Path(__file__).parent/"data"/"panel_cases").glob("*.csv")):
+            z.write(p,arcname=p.name)
+    st.download_button("Descargar los 18 CSV de los seis paneles",buf.getvalue(),file_name="ElectroPV_6_paneles_18_pruebas.zip",mime="application/zip",type="primary")
+    st.caption("Los CSV anteriores de GPVS siguen disponibles en Inicio. Esos 16 archivos corresponden a otro conjunto experimental, no a 16 paneles.")
+    st.markdown("### Comparación supervisada y no supervisada")
+    st.write("La prueba supervisada deja fuera un panel físico completo, entrena con los otros cinco y predice sus tres condiciones. Repite esto para cada panel. K-means agrupa las 18 pruebas por similitud sin usar sus nombres durante el agrupamiento.")
+    if st.button("Ejecutar comparación para los seis paneles",type="primary"):
+        try:
+            with st.spinner("Comparando paneles; puede tardar unos segundos…"):
+                sup=evaluate_panels_supervised(panels,modality)
+                uns=evaluate_panels_unsupervised(panels,modality)
+                meta={"fecha":datetime.now().isoformat(timespec="seconds"),"dataset":"Mismatching PV Modules","paneles":6,"casos":18,"modalidad":modality,"kmeans":{"k":3,"silhouette":uns["silhouette"],"ari":uns["ari"]}}
+                save_panel_experiment(meta,sup["tabla"])
+                st.session_state["panel_eval"]=(sup,uns)
+        except Exception as e:
+            st.error(f"No se pudo ejecutar la comparación: {e}")
+    if "panel_eval" in st.session_state:
+        sup,uns=st.session_state["panel_eval"]
+        st.markdown("#### Resultados de modelos supervisados")
+        st.caption("Cada fila evaluada representa un panel físico y una condición. Son 18 casos; no se mezclan fragmentos del mismo panel entre entrenamiento y prueba.")
+        st.dataframe(sup["tabla"].style.format({"Exactitud":"{:.1%}","Exactitud balanceada":"{:.1%}","F1 macro":"{:.1%}"}),use_container_width=True,hide_index=True)
+        pred=sup["predictions"].rename(columns={"panel_id":"Panel físico","modelo":"Modelo","real":"Condición real","predicho":"Predicción","ventanas":"Fragmentos"})
+        st.dataframe(pred,use_container_width=True,hide_index=True)
+        st.markdown("#### K-means: grupos por similitud")
+        st.write(f"Silhouette: **{uns['silhouette']:.3f}** · ARI: **{uns['ari']:.3f}**. Son medidas de agrupamiento; no son porcentajes de diagnóstico correcto.")
+        fig=px.scatter(uns["plot"],x="Componente 1",y="Componente 2",color="Grupo K-means",symbol="condicion",hover_data=["panel_id","modelo","condicion"],title="18 pruebas de paneles resumidas en dos dimensiones")
+        st.plotly_chart(fig,use_container_width=True)
+        st.dataframe(uns["mapping"],use_container_width=True,hide_index=True)
+        st.info("Datos reales publicados por Mendeley Data: [Experimental data for Mismatching Faults of Photovoltaic Modules](https://data.mendeley.com/datasets/xjs42j8dtf/1), CC BY 4.0. Son seis muestras de panel, no seis plantas completas.")
 
 elif page=="Evaluar modelos":
     st.title("Evaluar modelos")
@@ -199,28 +259,4 @@ elif page=="Entender el proyecto":
     st.markdown("### Estados del conjunto")
     st.dataframe(pd.DataFrame([{"Código":k,"Estado":v} for k,v in FAULT_NAMES.items()]),hide_index=True,use_container_width=True)
     st.warning("El punto de falla se aproxima usando la mitad del archivo porque el conjunto indica que la falla se introduce a mitad de cada experimento. Para un CSV nuevo desconocido, las predicciones son exploratorias; la aplicación no conoce la verdad del archivo.")
-
-elif page=="Sustentación":
-    st.title("Guion breve para presentar")
-    st.markdown("### Resumen de 45 segundos")
-    st.info("Mi proyecto se llama ElectroPV y estudia la detección de fallas en un sistema fotovoltaico conectado a la red. Utiliza GPVS-Faults, un conjunto público obtenido en experimentos de laboratorio, con 16 registros que combinan operación normal y siete tipos de falla en dos modos. La aplicación procesa señales de corriente y voltaje, las convierte en características y compara modelos supervisados con agrupamiento K-means. La evaluación entrena con un modo de operación y prueba con el otro para evitar que fragmentos del mismo registro queden en entrenamiento y prueba. Los resultados son experimentales y no garantizan desempeño en cualquier instalación solar.")
-    st.markdown("### Si el profesor pregunta…")
-    questions={
-        "¿Cómo hiciste la aplicación web?":"La interfaz se implementó en Python con Streamlit. Pandas procesa los CSV; scikit-learn entrena y evalúa los modelos; Plotly muestra métricas y gráficos. Los archivos de ejemplo están incluidos.",
-        "¿Los datos son reales?":"Sí. Son mediciones eléctricas de pruebas experimentales de laboratorio, publicadas en Mendeley Data con licencia CC BY 4.0. No son datos sintéticos ni mediciones tomadas de una planta comercial.",
-        "¿Qué significa multimodal?":"Se combinan mediciones de corriente y voltaje. La app permite comparar corriente sola, voltaje solo y ambas juntas.",
-        "¿Qué algoritmos usaste?":"Árbol de decisión, Random Forest y regresión logística como modelos supervisados; K-means como agrupamiento no supervisado.",
-        "¿Qué es Random Forest?":"Combina las decisiones de muchos árboles de clasificación para decidir qué etiqueta se ajusta mejor a las características de una ventana.",
-        "¿Qué es K-means?":"Forma K grupos con mediciones similares sin conocer sus etiquetas. Después comparamos los grupos con las etiquetas reales para analizarlos.",
-        "¿Qué es una ventana?":"Es un bloque de 1.024 mediciones consecutivas. Resumimos ese bloque con cinco cálculos por cada señal para que el modelo pueda compararlo.",
-        "¿Cómo evaluaste sin fuga de datos?":"Usé un modo completo para entrenar y el otro modo completo para probar. Los fragmentos de un mismo archivo no se reparten entre ambos conjuntos.",
-        "¿El resultado sirve para cualquier planta?":"No se puede afirmar. Los datos vienen de una bancada experimental concreta. Se necesitan mediciones de otras plantas y equipos para validar esa generalización.",
-        "¿Por qué pueden diferir los resultados al cambiar corriente por voltaje?":"Cada modalidad refleja otra parte del funcionamiento eléctrico. Una falla puede modificar más una señal que otra; la prueba compara esa diferencia en este conjunto.",
-        "¿Qué aporta la aplicación?":"Permite revisar los CSV, ejecutar las dos estrategias, comparar modalidades, visualizar errores y probar varios archivos de forma independiente. Guarda un resumen y el modelo entrenado localmente."
-    }
-    for q,a in questions.items():
-        with st.expander(q): st.write(a)
-    st.markdown("### Fuente de datos")
-    st.markdown("Bakdi, A., Guichi, A., Mekhilef, S. y Bounoua, W. (2020). [GPVS-Faults: Experimental Data for fault scenarios in grid-connected PV systems under MPPT and IPPT modes](https://data.mendeley.com/datasets/n76t439f65/1). Mendeley Data, V1. DOI: 10.17632/n76t439f65.1. Licencia CC BY 4.0.")
-    st.caption("La aplicación guarda métricas JSON y el modelo supervisado en la carpeta artifacts después de ejecutar la evaluación. Los CSV fuente y transformados se conservan sin sobrescribirlos.")
 

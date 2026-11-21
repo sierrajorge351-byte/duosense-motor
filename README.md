@@ -1,18 +1,21 @@
-# DuoSense · versión para alojamiento web
+# ElectroPV — diagnóstico de fallas fotovoltaicas
 
-Este paquete contiene solo lo necesario para ejecutar DuoSense en un servicio Streamlit:
+Aplicación académica para explorar y comparar modelos de Machine Learning con señales eléctricas experimentales de un sistema fotovoltaico conectado a la red.
 
-- `app.py` y `ml_core.py`: interfaz y lógica de análisis.
-- `requirements.txt`: componentes de Python necesarios.
-- `data/paderborn_real_features.csv` y `data/paderborn_real_examples.npz`: datos derivados incluidos con la aplicación.
+## Incluye
+- Clasificación supervisada: árbol de decisión, Random Forest y regresión logística.
+- Agrupamiento no supervisado: K-means, silhouette y ARI.
+- Tres modalidades: corriente, voltaje y combinación.
+- Evaluación por archivos completos, entrenando en un modo y probando en el otro.
+- Dieciséis CSV compactos listos para cargar y probar.
+- Carga de archivos nuevos, visualización y guardado de métricas/modelos.
 
-No incluye la presentación ni documentos con datos personales del estudiante.
+## Ejecutar
+Instala los paquetes de `requirements.txt` y ejecuta `streamlit run app.py`.
+En **Evaluar modelos** compara algoritmos; en **Probar mis CSV** carga uno o varios casos de forma independiente.
 
-## Atribución y uso de los datos
+## Datos y atribución
+Bakdi, A., Guichi, A., Mekhilef, S. y Bounoua, W. (2020). *GPVS-Faults: Experimental Data for fault scenarios in grid-connected PV systems under MPPT and IPPT modes*. Mendeley Data, V1. DOI: 10.17632/n76t439f65.1. Licencia CC BY 4.0.
+Fuente: https://data.mendeley.com/datasets/n76t439f65/1
 
-Los datos experimentales de Paderborn se distribuyen bajo CC BY-NC 4.0 para uso académico no comercial. Referencia: Christian Lessmeier et al., *KAt-DataCenter: Condition Monitoring of Bearing Damage in Electromechanical Drive Systems Using Motor Current Signals: A Benchmark Data Set for Data-Driven Classification*, Paderborn University (2016). Bearing DataCenter: https://mb.uni-paderborn.de/en/kat/research/bearing-datacenter.
-
-## Alcance
-
-La aplicación es un prototipo académico. El conjunto incluido contiene dos rodamientos físicos (uno saludable y uno con daño); las métricas no demuestran que el modelo generalice a otros rodamientos.
-
+Los datos proceden de ensayos de laboratorio. Los resultados no prueban generalización a cualquier planta fotovoltaica.

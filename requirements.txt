@@ -1,8 +1,7 @@
-streamlit>=1.40,<2
+streamlit>=1.37,<2
+pandas>=2.2,<3
 numpy>=1.26,<3
-pandas>=2.2,<4
-scipy>=1.13,<2
 scikit-learn>=1.5,<2
-matplotlib>=3.9,<4
+plotly>=5.22,<7
 joblib>=1.4,<2
 

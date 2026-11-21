@@ -1,145 +1,171 @@
-"""Multimodal motor-fault lab: synchronized vibration and current modalities."""
+"""Procesamiento y modelos para ElectroPV (GPVS-Faults)."""
 from __future__ import annotations
+
+import io
+import re
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, sosfiltfilt
-from scipy.stats import kurtosis
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (accuracy_score, adjusted_rand_score, classification_report,
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score, adjusted_rand_score,
+                             balanced_accuracy_score, classification_report,
                              confusion_matrix, f1_score, silhouette_score)
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from pathlib import Path
+from sklearn.tree import DecisionTreeClassifier
 
-FS = 64000
-SAMPLES = 16384
-CLASSES = ["Saludable", "Daño real de rodamiento"]
-FEATURES = [
-    "vib_rms", "vib_kurtosis", "vib_crest", "vib_dom_hz", "vib_hf_ratio",
-    "current_rms", "current_kurtosis", "current_crest", "current_dom_hz", "current_sideband_ratio",
-]
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data" / "csv_pruebas"
+ARTIFACT_DIR = ROOT / "artifacts"
+WINDOW = 1024
+CHANNELS = ["Ipv", "Vpv", "Vdc", "ia", "ib", "ic", "va", "vb", "vc", "Iabc", "If", "Vabc", "Vf"]
+CURRENT = {"Ipv", "ia", "ib", "ic", "Iabc", "If"}
+VOLTAGE = {"Vpv", "Vdc", "va", "vb", "vc", "Vabc", "Vf"}
+FAULTS = {0: "Normal", 1: "Falla en el arreglo fotovoltaico", 2: "Falla en el inversor",
+          3: "Anomalía de red", 4: "Falla del sensor de realimentación",
+          5: "Falla de conexión a red", 6: "Falla del controlador MPPT",
+          7: "Falla del convertidor elevador (boost)"}
+FAULTS_ES = {0: "Normal", 1: "Arreglo fotovoltaico", 2: "Inversor", 3: "Red eléctrica",
+             4: "Sensor de realimentación", 5: "Conexión a red", 6: "Control MPPT", 7: "Convertidor boost"}
 
 
-def validate_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Validate user-supplied feature CSV data before model fitting."""
-    required = FEATURES + ["estado", "recording"]
-    missing = [column for column in required if column not in frame.columns]
+def feature_columns(modality: str) -> list[str]:
+    allowed = CURRENT if modality == "Corriente" else VOLTAGE if modality == "Voltaje" else CURRENT | VOLTAGE
+    return [c for c in feature_names() if c.split("_")[0] in allowed]
+
+
+def feature_names() -> list[str]:
+    return [f"{ch}_{stat}" for ch in CHANNELS for stat in ("media", "rms", "desv", "curtosis", "factor_cresta")]
+
+
+def load_builtin() -> pd.DataFrame:
+    frames = []
+    for file in sorted(DATA_DIR.glob("F[0-7][LM].csv")):
+        part = pd.read_csv(file)
+        part["origen"] = file.stem
+        frames.append(part)
+    if not frames:
+        raise FileNotFoundError("No se encontraron los 16 CSV de demostración.")
+    return pd.concat(frames, ignore_index=True)
+
+
+def raw_to_features(raw: pd.DataFrame, filename: str = "archivo.csv") -> pd.DataFrame:
+    """Convierte señales crudas al mismo formato de ventanas usado por los ejemplos."""
+    aliases = {str(c).strip().lower(): c for c in raw.columns}
+    missing = [c for c in ["Time", *CHANNELS] if c.lower() not in aliases]
     if missing:
-        raise ValueError("Faltan columnas requeridas: " + ", ".join(missing))
-    result = frame.copy()
-    for column in FEATURES:
-        result[column] = pd.to_numeric(result[column], errors="coerce")
-    if result[required].isna().any().any() or not np.isfinite(result[FEATURES].to_numpy(dtype=float)).all():
-        raise ValueError("Hay valores vacíos, infinitos o no numéricos en las características o etiquetas.")
-    result["estado"] = result["estado"].astype(str)
-    result["recording"] = result["recording"].astype(str)
-    if set(result["estado"]) != set(CLASSES):
-        raise ValueError("'estado' debe contener exactamente las clases: " + " y ".join(CLASSES))
-    groups_per_class = result.groupby("estado")["recording"].nunique()
-    if groups_per_class.min() < 4:
-        raise ValueError("Incluye al menos cuatro archivos de medición (recording) por clase.")
+        raise ValueError("El CSV crudo debe tener columnas Time, Ipv, Vpv, Vdc, ia, ib, ic, va, vb, vc, Iabc, If, Vabc y Vf.")
+    values = raw[[aliases[c.lower()] for c in CHANNELS]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values).all(axis=1)]
+    if len(values) < WINDOW:
+        raise ValueError(f"Se requieren al menos {WINDOW} filas válidas; se recibieron {len(values)}.")
+    # Las filas iniciales se consideran fase previa. En los datos GPVS la avería
+    # se inyecta aproximadamente a mitad del registro; en un archivo nuevo no
+    # se asigna etiqueta real, solo se estiman ventanas para inferencia.
+    out = []
+    for start in range(0, len(values) - WINDOW + 1, WINDOW):
+        x = values[start:start + WINDOW]
+        feats = []
+        for j in range(len(CHANNELS)):
+            s = x[:, j]; mean = float(s.mean()); rms = float(np.sqrt(np.mean(s * s)))
+            sd = float(s.std()); kurt = float(np.mean(((s - mean) / sd) ** 4)) if sd > 1e-12 else 0.0
+            crest = float(np.max(np.abs(s)) / rms) if rms > 1e-12 else 0.0
+            feats.extend([mean, rms, sd, kurt, crest])
+        out.append(feats)
+    result = pd.DataFrame(out, columns=feature_names())
+    result["archivo_origen"] = Path(filename).stem
+    result["modo"] = "Subido"
+    result["ventana"] = np.arange(len(result))
+    result["fase"] = "Sin etiqueta conocida"
+    result["etiqueta"] = -1
+    result["origen"] = Path(filename).stem
     return result
 
 
-def _features(signal: np.ndarray, prefix: str, fs: int) -> dict[str, float]:
-    x = np.asarray(signal, dtype=float)
-    x = x - np.mean(x)
-    rms = float(np.sqrt(np.mean(x*x)))
-    spectrum = np.abs(np.fft.rfft(x))
-    freqs = np.fft.rfftfreq(len(x), 1/fs)
-    power = spectrum**2
-    dominant = float(freqs[np.argmax(spectrum[1:]) + 1]) if len(spectrum) > 1 else 0.0
-    result = {
-        f"{prefix}_rms": rms,
-        f"{prefix}_kurtosis": float(kurtosis(x, fisher=False, bias=False)),
-        f"{prefix}_crest": float(np.max(np.abs(x)) / (rms + 1e-12)),
-        f"{prefix}_dom_hz": dominant,
+def read_uploaded_csv(uploaded) -> tuple[pd.DataFrame, str]:
+    data = uploaded.getvalue()
+    name = uploaded.name
+    df = pd.read_csv(io.BytesIO(data))
+    if set(feature_names()).issubset(df.columns):
+        df["origen"] = name.rsplit(".", 1)[0]
+        return df, "características"
+    return raw_to_features(df, name), "señales crudas procesadas"
+
+
+def get_split(df: pd.DataFrame, train_mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    test_mode = "M" if train_mode == "L" else "L"
+    train = df[(df["modo"] == train_mode) & (df["etiqueta"] >= 0)].copy()
+    test = df[(df["modo"] == test_mode) & (df["etiqueta"] >= 0)].copy()
+    return train, test
+
+
+def evaluate_supervised(df: pd.DataFrame, modality: str, train_mode: str) -> dict:
+    train, test = get_split(df, train_mode)
+    cols = feature_columns(modality)
+    if train.empty or test.empty:
+        raise ValueError("Faltan registros para separar los dos modos de operación.")
+    x_train = train[cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    x_test = test[cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_train = train["etiqueta"].astype(int); y_test = test["etiqueta"].astype(int)
+    available = sorted(y_train.unique())
+    models = {
+        "Árbol de decisión": DecisionTreeClassifier(max_depth=12, class_weight="balanced", random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=180, max_features="sqrt", class_weight="balanced_subsample", random_state=42, n_jobs=-1),
+        "Regresión logística": make_pipeline(StandardScaler(), LogisticRegression(max_iter=1200, class_weight="balanced", random_state=42))
     }
-    if prefix == "vib":
-        result["vib_hf_ratio"] = float(power[freqs >= 1000].sum() / (power.sum() + 1e-12))
-    else:
-        # Sideband energy away from the 50 Hz supply frequency in this German test setup.
-        side = ((freqs >= 10) & (freqs <= 45)) | ((freqs >= 55) & (freqs <= 100))
-        result["current_sideband_ratio"] = float(power[side].sum() / (power.sum() + 1e-12))
-    return result
+    scores = []; fitted = {}; predictions = {}
+    for name, model in models.items():
+        model.fit(x_train, y_train)
+        pred = model.predict(x_test).astype(int)
+        predictions[name] = pred
+        fitted[name] = model
+        scores.append({"Modelo": name, "Exactitud": accuracy_score(y_test, pred),
+                       "Exactitud balanceada": balanced_accuracy_score(y_test, pred),
+                       "F1 macro": f1_score(y_test, pred, average="macro", zero_division=0)})
+    best = max(scores, key=lambda x: x["F1 macro"])
+    name = best["Modelo"]; pred = predictions[name]
+    labels = sorted(set(y_test) | set(available))
+    report = classification_report(y_test, pred, labels=labels, output_dict=True, zero_division=0)
+    return {"tabla": pd.DataFrame(scores), "train": train, "test": test, "cols": cols,
+            "y_test": y_test, "pred": pred, "best": name, "model": fitted[name],
+            "labels": labels, "confusion": confusion_matrix(y_test, pred, labels=labels), "report": report}
 
 
-def build_dataset(data_dir: Path | None = None):
-    """Load the compact feature extract and example traces from Paderborn real data."""
-    data_dir = data_dir or Path(__file__).resolve().parent / "data"
-    frame = pd.read_csv(data_dir / "paderborn_real_features.csv")
-    pack = np.load(data_dir / "paderborn_real_examples.npz")
-    examples = {}
-    for label in CLASSES:
-        examples[label] = {
-            "vibration": pack[f"{label}_vibration"],
-            "current": pack[f"{label}_current"],
-            "t": pack[f"{label}_t"],
-        }
-    return frame, examples
+def evaluate_unsupervised(df: pd.DataFrame, modality: str, train_mode: str, k: int = 8) -> dict:
+    _, test = get_split(df, train_mode)
+    cols = feature_columns(modality)
+    x = test[cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    scaler = StandardScaler(); xs = scaler.fit_transform(x)
+    k = max(2, min(int(k), len(test) - 1))
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    clusters = km.fit_predict(xs)
+    silhouette = silhouette_score(xs, clusters, sample_size=min(1500, len(xs)), random_state=42) if len(np.unique(clusters)) > 1 else float("nan")
+    known = test["etiqueta"].astype(int).to_numpy()
+    ari = adjusted_rand_score(known, clusters) if (known >= 0).any() else None
+    pca = PCA(n_components=2, random_state=42); xy = pca.fit_transform(xs)
+    plot = pd.DataFrame({"Componente 1":xy[:,0],"Componente 2":xy[:,1],"Grupo K-means":clusters.astype(str),
+                         "Etiqueta conocida":test["etiqueta"].map(FAULTS_ES).fillna("Sin etiqueta").to_numpy(),
+                         "Experimento":test["origen"].to_numpy(),"Fase":test["fase"].to_numpy()})
+    mapping = plot.assign(_label=known).groupby("Grupo K-means")[["_label"]].agg(lambda s: int(pd.Series(s).mode().iloc[0]))
+    mapping["Grupo se parece más a"] = mapping["_label"].map(FAULTS_ES)
+    return {"test":test,"clusters":clusters,"silhouette":silhouette,"ari":ari,"plot":plot,
+            "pca_variance":float(pca.explained_variance_ratio_.sum()),"mapping":mapping.drop(columns="_label"),"model":km,"scaler":scaler}
 
 
-def train_supervised(data: pd.DataFrame, trees: int = 250):
-    x, y = data[FEATURES], data["estado"]
-    splitter = GroupShuffleSplit(n_splits=100, test_size=0.25, random_state=42)
-    train_idx = test_idx = None
-    for candidate_train, candidate_test in splitter.split(x, y, groups=data["recording"]):
-        if set(y.iloc[candidate_train]) == set(CLASSES) and set(y.iloc[candidate_test]) == set(CLASSES):
-            train_idx, test_idx = candidate_train, candidate_test
-            break
-    if train_idx is None or test_idx is None:
-        raise ValueError("No se pudo separar entrenamiento y prueba por archivos manteniendo ambas clases.")
-    x_train, x_test = x.iloc[train_idx], x.iloc[test_idx]
-    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-    idx_test = data.index[test_idx]
-    # One worker keeps the local app responsive on laptops with many logical cores.
-    model = RandomForestClassifier(n_estimators=trees, class_weight="balanced", random_state=42,
-                                   min_samples_leaf=2, n_jobs=1)
-    model.fit(x_train, y_train)
-    predicted = model.predict(x_test)
-    return model, (x_test, y_test, predicted, idx_test), {
-        "accuracy": float(accuracy_score(y_test, predicted)),
-        "f1_macro": float(f1_score(y_test, predicted, average="macro")),
-        "report": classification_report(y_test, predicted, labels=CLASSES, output_dict=True, zero_division=0),
-        "matrix": confusion_matrix(y_test, predicted, labels=CLASSES),
-        "train_size": int(len(x_train)), "test_size": int(len(x_test)),
-        "train_recordings": int(data.iloc[train_idx]["recording"].nunique()),
-        "test_recordings": int(data.iloc[test_idx]["recording"].nunique()),
-    }
-
-
-def cluster_unsupervised(data: pd.DataFrame, k: int = 2):
-    """Fit clustering using sensor features only; labels are consulted only for external evaluation."""
-    scaler = StandardScaler()
-    x_scaled = scaler.fit_transform(data[FEATURES])
-    model = KMeans(n_clusters=k, random_state=42, n_init=20)
-    cluster = model.fit_predict(x_scaled)
-    pca = PCA(n_components=2, random_state=42)
-    projection = pca.fit_transform(x_scaled)
-    return cluster, projection, {
-        "silhouette": float(silhouette_score(x_scaled, cluster)),
-        "ari_external": float(adjusted_rand_score(data["estado"], cluster)),
-        "counts": pd.Series(cluster).value_counts().sort_index().to_dict(),
-        "pca_explained_variance": pca.explained_variance_ratio_.tolist(),
-    }
-
-
-def elbow_curve(data: pd.DataFrame, max_k: int = 8):
-    """Return exploratory K-means inertia values after feature standardization."""
-    x_scaled = StandardScaler().fit_transform(data[FEATURES])
-    upper = max(1, min(int(max_k), len(data) - 1))
-    values = []
-    for k in range(1, upper + 1):
-        model = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=200)
-        model.fit(x_scaled)
-        values.append(float(model.inertia_))
-    return list(range(1, upper + 1)), values
-
-
-def filter_signal(values: np.ndarray, fs: int = FS, cutoff: float = 5000.0) -> np.ndarray:
-    sos = butter(4, cutoff, btype="lowpass", fs=fs, output="sos")
-    return sosfiltfilt(sos, np.asarray(values, dtype=float))
+def save_experiment(metadata: dict, result: dict) -> Path:
+    import json
+    import joblib
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    payload = dict(metadata)
+    payload["métricas"] = result["tabla"].to_dict(orient="records")
+    out = ARTIFACT_DIR / f"experimento_{stamp}.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    joblib.dump(result["model"], ARTIFACT_DIR / f"modelo_{stamp}.joblib")
+    return out
 

@@ -1,276 +1,226 @@
 from __future__ import annotations
 
+import io
 import json
-from datetime import datetime, timezone
-from pathlib import Path
+import zipfile
+from datetime import datetime
 
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from ml_core import CLASSES, FEATURES, FS, build_dataset, cluster_unsupervised, elbow_curve, filter_signal, train_supervised, validate_feature_frame
+from ml_core import (ARTIFACT_DIR, DATA_DIR, FAULTS_ES, evaluate_supervised,
+                     evaluate_unsupervised, feature_columns, load_builtin,
+                     read_uploaded_csv, save_experiment)
 
-ROOT = Path(__file__).resolve().parent
-ARTIFACTS = ROOT / "artifacts"
-ARTIFACTS.mkdir(exist_ok=True)
-
-st.set_page_config(page_title="DuoSense | Diagnóstico multimodal", page_icon="⚙️", layout="wide")
+st.set_page_config(page_title="ElectroPV | Diagnóstico inteligente", page_icon="⚡", layout="wide",
+                   initial_sidebar_state="expanded")
 st.markdown("""
 <style>
-  .block-container {max-width: 1320px; padding-top: 1.7rem; padding-bottom: 3rem;}
-  [data-testid="stAppViewContainer"] {background: linear-gradient(180deg,#f4f8fb 0%,#ffffff 330px);}
-  [data-testid="stSidebar"] {background: #10283f;}
-  [data-testid="stSidebar"] * {color: #eef6fa !important;}
-  [data-testid="stSidebar"] [data-baseweb="select"] * {color:#10283f !important;}
-  [data-testid="stSidebar"] input {color:#10283f !important;}
-  .ds-hero {padding: 1.35rem 1.55rem; border-radius: 18px; color:white;
-    background: linear-gradient(120deg,#10283f,#176b78); margin: .15rem 0 1.1rem 0;
-    box-shadow: 0 12px 28px rgba(16,40,63,.14);}
-  .ds-hero h1 {color:white; margin:0 0 .25rem 0; font-size:2.25rem;}
-  .ds-hero p {color:#d9edf0; margin:0; font-size:1.02rem;}
-  .ds-kicker {font-size:.76rem; letter-spacing:.11em; text-transform:uppercase; color:#9be3dc; font-weight:700;}
-  div[data-testid="stMetric"] {background:white; border:1px solid #e3ebf0; border-radius:14px; padding: .75rem 1rem; box-shadow:0 3px 12px rgba(16,40,63,.045);}
-  div[data-testid="stMetricLabel"] {color:#496171;}
-  .ds-card {background:#fff; border:1px solid #e3ebf0; border-radius:14px; padding:1rem 1.1rem; height:100%;}
-  .ds-card h4 {margin:.15rem 0 .45rem 0; color:#10283f;}
-  .ds-card p {margin:0; color:#496171; font-size:.94rem;}
-  div[data-testid="stTabs"] button {font-weight:650;}
-  div[data-testid="stAlert"] {border-radius:12px;}
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap');
+html, body, [class*="css"] {font-family:'DM Sans',sans-serif;}
+.stApp {background:linear-gradient(180deg,#f4faf8 0%,#f7f9fc 42%,#fff 100%);}
+h1,h2,h3 {font-family:'Manrope',sans-serif!important;color:#123a35;}
+.hero {padding:1.5rem 1.8rem;border-radius:24px;background:linear-gradient(118deg,#123a35,#126d60 65%,#38a983);color:white;margin-bottom:1.1rem;}
+.hero h1 {color:white!important;font-size:2.35rem;margin:0 0 .35rem 0;}
+.hero p {color:#ddf4ed;font-size:1.05rem;margin:0;max-width:850px;}
+.pill {display:inline-block;border:1px solid #cde7de;color:#14634e;background:#effaf5;border-radius:999px;padding:.32rem .75rem;font-size:.82rem;margin:.15rem .3rem .15rem 0;}
+.callout {border-left:4px solid #16a47e;background:#eff8f4;padding:.85rem 1rem;border-radius:8px;color:#27473e;}
+[data-testid="stMetric"] {background:white;border:1px solid #e2ece8;padding:1rem;border-radius:16px;box-shadow:0 4px 16px #14382d0a;}
+section[data-testid="stSidebar"] {background:#f0f7f3;}
 </style>
-<div class="ds-hero"><div class="ds-kicker">Proyecto final · Machine Learning</div>
-<h1>DuoSense</h1><p>Explora la salud de un rodamiento con vibración y corriente del motor.</p></div>
 """, unsafe_allow_html=True)
-st.caption("Prototipo académico · datos experimentales Paderborn · aplicación web pública")
 
-with st.sidebar:
-    st.header("Ajustes de la prueba")
-    trees = st.slider("Árboles del clasificador", 100, 500, 250, step=50)
-    state = st.selectbox("Estado de la señal de ejemplo", CLASSES)
-    channel = st.radio("Modalidad para comparar", ["Vibración", "Corriente del motor"])
-    uploaded_csvs = st.file_uploader(
-        "Cargar uno o varios CSV de características",
-        type=["csv"],
-        accept_multiple_files=True,
-        key="feature_csvs",
-        help="Cada archivo debe incluir las diez características de DuoSense, 'estado' y 'recording'. Se requieren al menos cuatro archivos de medición por clase.",
-    )
-    st.caption("Cada CSV se conserva como conjunto separado. El original Paderborn permanece disponible.")
+FAULT_NAMES = {k: v for k, v in FAULTS_ES.items()}
+LABEL_OPTIONS = [f"{k} · {v}" for k,v in FAULT_NAMES.items()]
 
-@st.cache_data(show_spinner="Cargando mediciones reales y características multimodales…")
-def cached_data():
-    return build_dataset()
+@st.cache_data(show_spinner="Leyendo los 16 experimentos…")
+def get_data():
+    return load_builtin()
 
-@st.cache_resource(show_spinner="Entrenando el modelo supervisado…")
-def cached_supervised(frame, n_estimators):
-    return train_supervised(frame, n_estimators)
+def dataset_zip() -> bytes:
+    buf=io.BytesIO()
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(DATA_DIR.glob("F[0-7][LM].csv")):
+            z.write(p,arcname=p.name)
+    return buf.getvalue()
 
-@st.cache_data(show_spinner="Agrupando los registros sin usar sus etiquetas…")
-def cached_clusters(frame):
-    return cluster_unsupervised(frame, len(CLASSES))
+def label_names(values):
+    return [f"{v} · {FAULT_NAMES.get(int(v), 'Sin etiqueta')}" for v in values]
 
-@st.cache_data(show_spinner="Calculando la curva del codo…")
-def cached_elbow(frame):
-    return elbow_curve(frame, max_k=8)
+df_all=get_data()
+st.sidebar.markdown("## ⚡ ElectroPV")
+st.sidebar.caption("Diagnóstico de fallas en un sistema solar conectado a la red")
+page=st.sidebar.radio("Ir a",["Inicio","Evaluar modelos","Probar mis CSV","Entender el proyecto","Sustentación"],label_visibility="collapsed")
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Datos cargados**")
+st.sidebar.write("16 experimentos reales · 8 estados · 2 modos")
+st.sidebar.caption("Fuente: GPVS-Faults · Mendeley Data · CC BY 4.0")
 
-try:
-    data, examples = cached_data()
-except Exception as exc:
-    st.error(f"No se pudieron cargar los datos Paderborn incluidos. Comprueba que estén los archivos de la carpeta data. Detalle: {exc}")
-    st.stop()
-
-data_sources = {"Paderborn incluido": data}
-used_names = set(data_sources)
-invalid_uploads = []
-for uploaded_csv in uploaded_csvs:
-    try:
-        uploaded_frame = validate_feature_frame(pd.read_csv(uploaded_csv))
-        source_name = uploaded_csv.name
-        duplicate_number = 2
-        while source_name in used_names:
-            source_name = f"{uploaded_csv.name} ({duplicate_number})"
-            duplicate_number += 1
-        used_names.add(source_name)
-        data_sources[source_name] = uploaded_frame
-    except Exception as exc:
-        invalid_uploads.append(f"{uploaded_csv.name}: {exc}")
-
-with st.sidebar:
-    if invalid_uploads:
-        for message in invalid_uploads:
-            st.warning(f"Archivo omitido: {message}")
-    data_source = st.selectbox(
-        "Conjunto para revisar",
-        list(data_sources),
-        help="Cambiar de conjunto actualiza solo la vista y los resultados de ese archivo.",
-    )
-    st.caption(f"Disponibles en esta sesión: {len(data_sources)} conjuntos válidos.")
-
-data = data_sources[data_source]
-st.session_state["duosense_data_source"] = data_source
-
-overview = st.columns(4)
-overview[0].metric("Ventanas cargadas", f"{len(data):,}")
-overview[1].metric("Modalidades", "2")
-overview[2].metric("Estados", f"{data['estado'].nunique()}")
-overview[3].metric("Registros", f"{data['recording'].nunique()}")
-
-section = st.radio(
-    "Elige qué quieres explorar",
-    ["Inicio", "Clasificar", "Agrupar", "Señal antes/después", "Probar y guardar"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-
-if section == "Inicio":
+if page=="Inicio":
+    st.markdown("<div class='hero'><h1>ElectroPV</h1><p>Una aplicación para explorar señales eléctricas reales y comparar dos formas de encontrar fallas en sistemas fotovoltaicos.</p></div>",unsafe_allow_html=True)
+    for text in ["Datos de laboratorio reales","16 CSV listos para probar","Corriente + voltaje","Modelos supervisados y K-means"]:
+        st.markdown(f"<span class='pill'>✦ {text}</span>",unsafe_allow_html=True)
+    st.write("")
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Experimentos", "16", "8 situaciones × 2 modos")
+    c2.metric("Señales eléctricas", "13", "Corriente, voltaje y frecuencia")
+    c3.metric("Clases", "8", "Normal + 7 escenarios de falla")
+    c4.metric("Ventana de análisis", "1.024", "muestras por fragmento")
     st.markdown("### ¿Qué hace esta aplicación?")
-    st.write("Mira dos señales del mismo motor: cuánto vibra y cuánta corriente consume. Resume pequeños fragmentos de ambas y permite probar dos formas de encontrar patrones.")
-    st.caption(f"Datos usados en esta ejecución: {data_source} · {len(data)} ventanas · {data['recording'].nunique()} archivos de medición.")
-    a, b, c = st.columns(3)
+    a,b=st.columns(2)
     with a:
-        st.markdown('<div class="ds-card"><h4>① Medimos</h4><p>Vibración y corriente: dos pistas distintas sobre el mismo motor.</p></div>', unsafe_allow_html=True)
+        st.markdown("#### 1 · Aprende con respuestas conocidas")
+        st.write("Los modelos supervisados reciben fragmentos etiquetados como normal o con un tipo de falla. Después se prueban en registros del otro modo de funcionamiento, que no se usaron para entrenar.")
+        st.markdown("#### 2 · Busca grupos sin respuestas")
+        st.write("K-means organiza fragmentos parecidos sin mirar sus etiquetas durante el agrupamiento. Al final se comparan los grupos con las respuestas conocidas para evaluar qué tan relacionados quedaron.")
     with b:
-        st.markdown('<div class="ds-card"><h4>② Comparamos</h4><p>Un método aprende ejemplos conocidos; otro busca grupos por su cuenta.</p></div>', unsafe_allow_html=True)
-    with c:
-        st.markdown('<div class="ds-card"><h4>③ Interpretamos</h4><p>Revisamos métricas y señales, sin tratar el resultado como diagnóstico industrial.</p></div>', unsafe_allow_html=True)
-    st.markdown("#### Estados incluidos")
-    st.write("Saludable · Daño real de pista interior")
-    st.info("**Límite importante:** son mediciones reales, pero hay un solo rodamiento físico por estado. Las métricas describen este conjunto; no demuestran que el modelo funcione con otros motores.")
-    with st.expander("¿Qué significan las columnas de datos?"):
-        st.write("Cada fila resume un fragmento de señal. RMS indica su nivel; curtosis y factor de cresta ayudan a describir picos; frecuencia dominante y bandas de energía resumen su contenido. Se combinan cinco valores de vibración y cinco de corriente.")
-        st.dataframe(data.groupby("estado")[FEATURES].mean().round(3), use_container_width=True)
+        st.markdown("#### 3 · Compara señales")
+        st.write("Puedes analizar corriente, voltaje o ambos juntos. Así ves si combinar modalidades ayuda a reconocer las fallas en estas pruebas.")
+        st.markdown("#### 4 · Prueba CSV propios")
+        st.write("Carga uno o varios CSV. Cada archivo se procesa de forma independiente y la aplicación muestra la predicción por fragmento y el resumen del caso.")
+    st.info("Empieza en **Evaluar modelos** para ejecutar la comparación incluida. Para probar un archivo individual, abre **Probar mis CSV**.")
+    st.download_button("Descargar los 16 CSV de prueba",data=dataset_zip(),file_name="ElectroPV_CSV_reales_16_experimentos.zip",mime="application/zip",use_container_width=True)
+    st.caption("Los archivos descargables contienen características calculadas a partir de las señales reales. Para descargar las señales originales completas, visita la fuente Mendeley citada en la guía.")
 
-elif section == "Clasificar":
-    st.markdown("### Clasificar: aprender con ejemplos conocidos")
-    st.write("**Random Forest** aprende de fragmentos marcados como saludables o dañados y luego intenta clasificar fragmentos reservados para la prueba.")
-    st.caption("La prueba usa archivos de medición separados del entrenamiento. Sin embargo, ambos grupos aún incluyen los mismos dos rodamientos físicos.")
-    try:
-        model, test_pack, metrics = cached_supervised(data, trees)
-    except Exception as exc:
-        st.error(f"No se pudo entrenar el clasificador: {exc}")
-        st.stop()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Exactitud", f"{metrics['accuracy']:.1%}")
-    m2.metric("F1 macro", f"{metrics['f1_macro']:.3f}")
-    m3.metric("Prueba", f"{metrics['test_size']} ventanas")
-    cm = metrics["matrix"]
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(len(CLASSES)), CLASSES, rotation=15, ha="right")
-    ax.set_yticks(range(len(CLASSES)), CLASSES)
-    ax.set(xlabel="Predicción", ylabel="Etiqueta real", title="Matriz de confusión")
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color="black")
-    fig.colorbar(im, ax=ax, shrink=0.8)
-    st.pyplot(fig, clear_figure=True)
-    report_rows = {name: metrics["report"][name] for name in CLASSES}
-    st.dataframe(pd.DataFrame(report_rows).T[["precision", "recall", "f1-score", "support"]].round(3), use_container_width=True)
+elif page=="Evaluar modelos":
+    st.title("Evaluar modelos")
+    st.write("Se entrena con un modo de operación y se prueba con el otro. Así los fragmentos del mismo archivo no quedan repartidos entre entrenamiento y prueba.")
+    data=df_all.copy()
+    c1,c2,c3=st.columns([1,1,1.2])
+    train_mode=c1.selectbox("Entrenar con",["L","M"],format_func=lambda x: "L · Potencia limitada (IPPT)" if x=="L" else "M · Potencia máxima (MPPT)")
+    modality=c2.selectbox("Señales para el modelo",["Corriente + voltaje","Corriente","Voltaje"])
+    selected=c3.multiselect("Experimentos incluidos",sorted(data["origen"].unique()),default=sorted(data["origen"].unique()),help="Deja los 16 seleccionados para comparar todos los estados.")
+    data=data[data["origen"].isin(selected)]
+    if len(selected)<16:
+        st.warning("Para evaluar las ocho clases, incluye los registros de ambos modos (L y M) de cada escenario F0–F7.")
+    test_mode="M" if train_mode=="L" else "L"
+    st.markdown(f"**Entrenamiento:** archivos terminados en `{train_mode}` &nbsp; · &nbsp; **Prueba:** archivos terminados en `{test_mode}`",unsafe_allow_html=True)
+    if st.button("Ejecutar evaluación completa",type="primary",use_container_width=True):
+        with st.spinner("Entrenando y evaluando los modelos. Con estos datos suele tardar unos segundos…"):
+            try:
+                res=evaluate_supervised(data,modality,train_mode)
+                uns=evaluate_unsupervised(data,modality,train_mode,8)
+                st.session_state["eval"]={"supervised":res,"unsup":uns,"train_mode":train_mode,"modality":modality}
+                meta={"fecha":datetime.now().isoformat(timespec="seconds"),"entrenamiento":train_mode,"prueba":test_mode,"modalidad":modality,"archivos":selected,
+                      "kmeans":{"k":8,"silhouette":float(uns["silhouette"]),"ari":float(uns["ari"]) if uns["ari"] is not None else None,"varianza_pca_2d":float(uns["pca_variance"])}}
+                saved=save_experiment(meta,res)
+                st.session_state["saved_name"]=saved.name
+            except Exception as e: st.error(f"No se pudo ejecutar la evaluación: {e}")
+    if "eval" in st.session_state:
+        ev=st.session_state["eval"];res=ev["supervised"];uns=ev["unsup"]
+        st.markdown("---\n### Resultados supervisados")
+        st.caption("Los tres modelos reciben exactamente el mismo entrenamiento y prueba. El mejor se identifica por F1 macro.")
+        st.dataframe(res["tabla"].style.format({"Exactitud":"{:.1%}","Exactitud balanceada":"{:.1%}","F1 macro":"{:.1%}"}).highlight_max(axis=0,color="#d8f3e7"),use_container_width=True,hide_index=True)
+        k1,k2,k3,k4=st.columns(4)
+        best_row=res["tabla"].set_index("Modelo").loc[res["best"]]
+        k1.metric("Modelo destacado",res["best"])
+        k2.metric("Exactitud",f"{best_row['Exactitud']:.1%}")
+        k3.metric("F1 macro",f"{best_row['F1 macro']:.1%}")
+        k4.metric("Ventanas de prueba",f"{len(res['test']):,}")
+        st.markdown("#### Matriz de confusión del modelo destacado")
+        labels=res["labels"]; cm=pd.DataFrame(res["confusion"],index=label_names(labels),columns=label_names(labels))
+        fig=px.imshow(cm,text_auto=True,color_continuous_scale="Teal",aspect="auto",labels=dict(x="Predicción",y="Respuesta conocida",color="Ventanas"))
+        fig.update_layout(height=520,margin=dict(l=8,r=8,t=24,b=8),xaxis_tickangle=-35)
+        st.plotly_chart(fig,use_container_width=True)
+        with st.expander("¿Cómo se lee esta matriz?"):
+            st.write("Las filas son la condición real conocida del experimento y las columnas son lo que predijo el modelo. Los números de la diagonal son aciertos; los que quedan fuera muestran confusiones entre estados.")
+        st.markdown("### Resultados no supervisados · K-means")
+        u1,u2,u3=st.columns(3)
+        u1.metric("Grupos buscados",8,"uno por cada escenario esperado")
+        u2.metric("Silhouette",f"{uns['silhouette']:.3f}",help="Entre -1 y 1. Resume si los grupos se ven compactos y separados; no es exactitud.")
+        u3.metric("ARI frente a etiquetas",f"{uns['ari']:.3f}" if uns["ari"] is not None else "N/D",help="Comparación posterior entre grupos y etiquetas conocidas. Las etiquetas no se usaron para formar los grupos.")
+        f2=px.scatter(uns["plot"],x="Componente 1",y="Componente 2",color="Grupo K-means",symbol="Etiqueta conocida",hover_data=["Experimento","Fase"],title="Fragmentos agrupados (PCA solo para visualizar)")
+        f2.update_layout(height=500)
+        st.plotly_chart(f2,use_container_width=True)
+        st.caption(f"Los dos ejes del gráfico conservan {uns['pca_variance']:.1%} de la variación de características; es un resumen 2D. Silhouette no es porcentaje de aciertos; ARI solo compara los grupos con las etiquetas después del ajuste.")
+        st.markdown("#### Grupo y clase más frecuente después de comparar")
+        st.dataframe(uns["mapping"],use_container_width=True)
+        c1,c2=st.columns(2)
+        if st.session_state.get("saved_name"):
+            p=ARTIFACT_DIR / st.session_state["saved_name"]
+            if p.exists(): c1.download_button("Descargar resumen de este experimento",p.read_bytes(),file_name=p.name,mime="application/json")
+        c2.download_button("Descargar predicciones detalladas",data=pd.DataFrame({"archivo":res["test"]["origen"].to_numpy(),"ventana":res["test"]["ventana"].to_numpy(),"real":res["y_test"].map(FAULTS_ES).to_numpy(),"predicho":[FAULTS_ES.get(int(y),"Desconocido") for y in res["pred"]]}).to_csv(index=False).encode("utf-8-sig"),file_name="ElectroPV_predicciones.csv",mime="text/csv")
+    st.markdown("---")
+    st.markdown("#### ¿Qué significa L y M?")
+    st.write("L es el modo de potencia limitada (IPPT); M es el seguimiento del punto de máxima potencia (MPPT). Se evalúa cruzando modos para que la prueba use registros distintos a los del entrenamiento.")
 
-elif section == "Agrupar":
-    st.markdown("### Agrupar: buscar patrones sin respuestas")
-    st.write("**K-means** intenta separar los fragmentos en grupos sin conocer las etiquetas. Primero estandarizamos las diez características para que las de mayor escala no dominen el cálculo.")
-    try:
-        clusters, projection, unsup = cached_clusters(data)
-        k_values, inertias = cached_elbow(data)
-    except Exception as exc:
-        st.error(f"No se pudieron agrupar los datos: {exc}")
-        st.stop()
-    u1, u2, u3 = st.columns(3)
-    u1.metric("Silhouette", f"{unsup['silhouette']:.3f}", help="Cohesión y separación interna de los grupos; no requiere etiquetas.")
-    u2.metric("ARI de comparación", f"{unsup['ari_external']:.3f}", help="Comparación posterior entre grupos y clases conocidas; no intervino en el agrupamiento.")
-    explained = sum(unsup["pca_explained_variance"])
-    u3.metric("Varianza mostrada por PCA", f"{explained:.1%}", help="Porcentaje de variación de las diez características representado en estos dos ejes.")
-    st.caption("Se muestran dos grupos porque el caso compara dos estados. La curva del codo ayuda a explorar K; no decide automáticamente el número de grupos.")
-    chart_left, chart_right = st.columns(2)
-    fig, ax = plt.subplots(figsize=(7, 4.4))
-    scatter = ax.scatter(projection[:, 0], projection[:, 1], c=clusters, cmap="viridis", s=18, alpha=0.75)
-    ax.set(title="Grupos proyectados con PCA", xlabel="Componente principal 1", ylabel="Componente principal 2")
-    ax.grid(alpha=0.2)
-    fig.colorbar(scatter, ax=ax, label="Grupo K-means")
-    chart_left.pyplot(fig, clear_figure=True)
-    fig, ax = plt.subplots(figsize=(7, 4.4))
-    ax.plot(k_values, inertias, marker="o", color="#0f766e", linewidth=2)
-    ax.axvline(len(CLASSES), color="#d97706", linestyle="--", linewidth=1.5, label="K usado = 2")
-    ax.set(title="Método del codo · búsqueda exploratoria", xlabel="Número de grupos (K)", ylabel="Inercia dentro de los grupos")
-    ax.set_xticks(k_values)
-    ax.grid(alpha=0.2)
-    ax.legend(frameon=False)
-    chart_right.pyplot(fig, clear_figure=True)
-    st.caption(f"Los componentes de PCA representan {unsup['pca_explained_variance'][0]:.1%} y {unsup['pca_explained_variance'][1]:.1%} de la variación; juntos, {explained:.1%}.")
-    composition = pd.crosstab(data["estado"], pd.Series(clusters, name="Grupo"))
-    st.markdown("#### ¿Qué estados terminaron en cada grupo?")
-    st.dataframe(composition, use_container_width=True)
-    st.info("El ARI se calcula al final, al comparar grupos con las etiquetas conocidas. Las etiquetas no participan en K-means. El codo es una guía visual, no una prueba de que los grupos sean clases reales.")
+elif page=="Probar mis CSV":
+    st.title("Probar mis CSV")
+    st.write("Carga uno o varios archivos. Cada archivo se analiza por separado; subir un caso nuevo no modifica los resultados anteriores ni los CSV incluidos.")
+    files=st.file_uploader("Selecciona archivos CSV",type=["csv"],accept_multiple_files=True,help="Acepta CSV de características descargados desde Inicio o CSV crudos del dataset GPVS-Faults con sus 14 columnas originales.")
+    modality=st.selectbox("Usar señales",["Corriente + voltaje","Corriente","Voltaje"],key="inference_modality")
+    train_mode=st.radio("Entrenar el modelo base con",["L","M"],horizontal=True,format_func=lambda x:"L · potencia limitada" if x=="L" else "M · potencia máxima")
+    if files and st.button("Analizar archivos",type="primary"):
+        with st.spinner("Preparando el modelo y analizando cada archivo…"):
+            full=get_data(); train=full[full["modo"]==train_mode]; cols=feature_columns(modality)
+            from sklearn.ensemble import RandomForestClassifier
+            model=RandomForestClassifier(n_estimators=180,max_features="sqrt",class_weight="balanced_subsample",random_state=42,n_jobs=-1)
+            model.fit(train[cols].fillna(0),train["etiqueta"].astype(int))
+            all_results=[]
+            for f in files:
+                try:
+                    pdata,kind=read_uploaded_csv(f)
+                    pred=model.predict(pdata[cols].replace([float("inf"),-float("inf")],float("nan")).fillna(0)).astype(int)
+                    pdata["prediccion"]=[FAULTS_ES.get(int(y),"Estado no identificado") for y in pred]
+                    counts=pd.Series(pdata["prediccion"]).value_counts(normalize=True).mul(100).round(1)
+                    label=counts.index[0]
+                    all_results.append({"nombre":f.name,"tipo":kind,"n":len(pdata),"label":label,"porcentajes":counts,"data":pdata})
+                except Exception as e:
+                    st.error(f"{f.name}: {e}")
+            st.session_state["uploads_results"]=all_results
+    for result in st.session_state.get("uploads_results",[]):
+        with st.container(border=True):
+            st.markdown(f"### {result['nombre']}")
+            st.caption(f"Entrada: {result['tipo']} · {result['n']} fragmentos analizados")
+            st.success(f"Estado más frecuente: **{result['label']}**")
+            chart=result["porcentajes"].rename_axis("Estado estimado").reset_index(name="Porcentaje")
+            st.bar_chart(chart.set_index("Estado estimado"),y="Porcentaje",color="#159274")
+            st.caption("La barra resume las predicciones por fragmento de este archivo. Es una salida del modelo, no una certificación del estado físico del equipo.")
+            st.download_button(f"Descargar predicciones de {result['nombre']}",result["data"].to_csv(index=False).encode("utf-8-sig"),file_name=f"predicciones_{result['nombre']}",mime="text/csv",key=f"download_{result['nombre']}")
 
-elif section == "Señal antes/después":
-    st.markdown("### Ver la señal original y la filtrada")
-    st.write("El filtro reduce componentes por encima de 5 kHz para facilitar la inspección visual de la traza.")
-    example = examples[state]
-    key = "vibration" if channel == "Vibración" else "current"
-    raw = example[key]
-    processed = filter_signal(raw, fs=FS, cutoff=5000)
-    t = example["t"]
-    stop = int(0.03 * FS)
-    before, after = st.columns(2)
-    with before:
-        st.markdown("**Antes · señal cruda**")
-        fig, ax = plt.subplots(figsize=(6, 3.3))
-        ax.plot(t[:stop], raw[:stop], color="#d97706", lw=0.9)
-        ax.set(xlabel="Tiempo (s)", ylabel="Amplitud", title=channel)
-        ax.grid(alpha=0.2)
-        st.pyplot(fig, clear_figure=True)
-    with after:
-        st.markdown("**Después · filtro pasa-bajas, 5 kHz**")
-        fig, ax = plt.subplots(figsize=(6, 3.3))
-        ax.plot(t[:stop], processed[:stop], color="#0f766e", lw=0.9)
-        ax.set(xlabel="Tiempo (s)", ylabel="Amplitud", title="Señal filtrada")
-        ax.grid(alpha=0.2)
-        st.pyplot(fig, clear_figure=True)
-    st.caption("Las gráficas muestran trazas reales del conjunto Paderborn incluido, muestreadas a 64 kHz; cargarlas en la tabla de características no reemplaza estas trazas. El filtro es visual: el modelo se entrena con características de las señales crudas.")
+elif page=="Entender el proyecto":
+    st.title("Entender el proyecto")
+    st.markdown("### En palabras sencillas")
+    st.write("El sistema solar produce corriente continua en los paneles. Un inversor la convierte en corriente alterna para conectarse a la red. Sensores registran cómo cambian corrientes y voltajes. Cuando se introduce una falla, algunas señales cambian. ElectroPV convierte pequeñas partes de esas señales en números y estudia esos patrones.")
+    with st.expander("¿Qué es multimodal aquí?",expanded=True):
+        st.write("Multimodal significa usar más de un tipo de medición. En este caso usamos **corriente** y **voltaje**. Corriente sola y voltaje solo son pruebas comparables; al combinarlas el modelo recibe ambas fuentes de información.")
+    with st.expander("¿Qué hace el método supervisado?"):
+        st.write("Aprende usando ejemplos con respuesta conocida. Por ejemplo, los datos F2 después de introducir la falla se etiquetan como falla del inversor. Luego el modelo predice la clase de fragmentos de otros registros. Se usan un árbol, Random Forest y regresión logística.")
+    with st.expander("¿Qué hace K-means?"):
+        st.write("K-means recibe los números, pero no los nombres de las fallas. Separa los fragmentos en grupos por semejanza. Solo después se compara qué etiquetas conocidas hay en cada grupo. Por eso silhouette no es exactitud y ARI es una medida de concordancia posterior.")
+    with st.expander("¿Cómo se preparan los datos?"):
+        st.write("Se excluye la columna Time como predictor, se trabaja con las 13 señales eléctricas, se cortan en ventanas consecutivas de 1.024 muestras y por señal se calculan media, RMS, desviación estándar, curtosis y factor de cresta. Resultan 65 características por ventana. Para F1–F7, las ventanas anteriores al punto medio se consideran normales y las posteriores conservan la etiqueta de la falla del archivo. F0 es normal durante todo el registro.")
+    with st.expander("¿Cómo se evita una prueba engañosa?"):
+        st.write("No se mezclan ventanas del mismo CSV entre entrenamiento y prueba. Se entrena con todos los registros de un modo (L o M) y se prueba con los del otro. Es una prueba más exigente de cambio de modo, pero los datos son de una misma bancada experimental: no demuestra por sí sola que el modelo funcione en cualquier planta real.")
+    with st.expander("¿Qué miden las métricas?"):
+        st.markdown("- **Exactitud:** fracción total de ventanas clasificadas correctamente.\n- **Exactitud balanceada:** promedia el acierto por clase para que ninguna clase pese solo por tener más datos.\n- **F1 macro:** combina precisión y recuperación y luego promedia las clases por igual.\n- **Silhouette:** resume qué tan compactos y separados quedaron los grupos; puede ser negativo o llegar a 1.\n- **ARI:** compara después los grupos encontrados contra las etiquetas conocidas; 1 indica coincidencia, 0 parecido al azar y valores negativos peor que azar.")
+    st.markdown("### Estados del conjunto")
+    st.dataframe(pd.DataFrame([{"Código":k,"Estado":v} for k,v in FAULT_NAMES.items()]),hide_index=True,use_container_width=True)
+    st.warning("El punto de falla se aproxima usando la mitad del archivo porque el conjunto indica que la falla se introduce a mitad de cada experimento. Para un CSV nuevo desconocido, las predicciones son exploratorias; la aplicación no conoce la verdad del archivo.")
 
-elif section == "Probar y guardar":
-    st.markdown("### Probar una ventana y guardar el resultado")
-    st.write("Elige un fragmento reservado para ver qué clase predice el modelo. El botón de abajo guarda el modelo y un resumen de métricas en la carpeta `artifacts`.")
-    try:
-        model, test_pack, metrics = cached_supervised(data, trees)
-    except Exception as exc:
-        st.error(f"No se pudo entrenar el modelo para la prueba: {exc}")
-        st.stop()
-    x_test, y_test, y_pred, test_indices = test_pack
-    selected = st.selectbox("Ventana de prueba", list(range(min(30, len(x_test)))), format_func=lambda i: f"Ventana {i+1}")
-    row = x_test.iloc[[selected]]
-    predicted = model.predict(row)[0]
-    actual = y_test.iloc[selected]
-    p1, p2 = st.columns(2)
-    p1.metric("Clasificación del modelo", predicted)
-    p2.metric("Etiqueta de referencia", actual)
-    with st.expander("Características de las dos modalidades"):
-        st.dataframe(row.T.rename(columns={row.index[0]: "Valor"}), use_container_width=True)
-    st.write("La clasificación es exploratoria: los datos contienen un rodamiento por estado y no representan validación independiente entre equipos.")
-    if st.button("Guardar modelo y métricas", type="primary"):
-        import joblib
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        model_path = ARTIFACTS / f"random_forest_{stamp}.joblib"
-        metrics_path = ARTIFACTS / f"resultados_{stamp}.json"
-        try:
-            joblib.dump(model, model_path)
-            payload = {"source": data_source, "classes": CLASSES, "features": FEATURES,
-                       "n_estimators": trees, "accuracy": metrics["accuracy"], "f1_macro": metrics["f1_macro"],
-                       "confusion_matrix": metrics["matrix"].tolist(),
-                       "group_split_recordings": {"train": metrics["train_recordings"], "test": metrics["test_recordings"]}, "created_utc": stamp}
-            metrics_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            st.success(f"Modelo y resultados guardados en {ARTIFACTS}")
-        except Exception as exc:
-            st.error(f"No se pudieron guardar los artefactos. Detalle: {exc}")
-
-st.divider()
-st.caption("DuoSense · prototipo académico con mediciones reales de Paderborn · no es instrumento de monitoreo")
-
-# The Windows launcher waits for this marker before opening the browser, so it
-# does not show a blank page while Streamlit is still running the first script.
-try:
-    (ROOT / ".duosense_ready").write_text("ready", encoding="utf-8")
-except OSError:
-    pass
+elif page=="Sustentación":
+    st.title("Guion breve para presentar")
+    st.markdown("### Resumen de 45 segundos")
+    st.info("Mi proyecto se llama ElectroPV y estudia la detección de fallas en un sistema fotovoltaico conectado a la red. Utiliza GPVS-Faults, un conjunto público obtenido en experimentos de laboratorio, con 16 registros que combinan operación normal y siete tipos de falla en dos modos. La aplicación procesa señales de corriente y voltaje, las convierte en características y compara modelos supervisados con agrupamiento K-means. La evaluación entrena con un modo de operación y prueba con el otro para evitar que fragmentos del mismo registro queden en entrenamiento y prueba. Los resultados son experimentales y no garantizan desempeño en cualquier instalación solar.")
+    st.markdown("### Si el profesor pregunta…")
+    questions={
+        "¿Cómo hiciste la aplicación web?":"La interfaz se implementó en Python con Streamlit. Pandas procesa los CSV; scikit-learn entrena y evalúa los modelos; Plotly muestra métricas y gráficos. Los archivos de ejemplo están incluidos.",
+        "¿Los datos son reales?":"Sí. Son mediciones eléctricas de pruebas experimentales de laboratorio, publicadas en Mendeley Data con licencia CC BY 4.0. No son datos sintéticos ni mediciones tomadas de una planta comercial.",
+        "¿Qué significa multimodal?":"Se combinan mediciones de corriente y voltaje. La app permite comparar corriente sola, voltaje solo y ambas juntas.",
+        "¿Qué algoritmos usaste?":"Árbol de decisión, Random Forest y regresión logística como modelos supervisados; K-means como agrupamiento no supervisado.",
+        "¿Qué es Random Forest?":"Combina las decisiones de muchos árboles de clasificación para decidir qué etiqueta se ajusta mejor a las características de una ventana.",
+        "¿Qué es K-means?":"Forma K grupos con mediciones similares sin conocer sus etiquetas. Después comparamos los grupos con las etiquetas reales para analizarlos.",
+        "¿Qué es una ventana?":"Es un bloque de 1.024 mediciones consecutivas. Resumimos ese bloque con cinco cálculos por cada señal para que el modelo pueda compararlo.",
+        "¿Cómo evaluaste sin fuga de datos?":"Usé un modo completo para entrenar y el otro modo completo para probar. Los fragmentos de un mismo archivo no se reparten entre ambos conjuntos.",
+        "¿El resultado sirve para cualquier planta?":"No se puede afirmar. Los datos vienen de una bancada experimental concreta. Se necesitan mediciones de otras plantas y equipos para validar esa generalización.",
+        "¿Por qué pueden diferir los resultados al cambiar corriente por voltaje?":"Cada modalidad refleja otra parte del funcionamiento eléctrico. Una falla puede modificar más una señal que otra; la prueba compara esa diferencia en este conjunto.",
+        "¿Qué aporta la aplicación?":"Permite revisar los CSV, ejecutar las dos estrategias, comparar modalidades, visualizar errores y probar varios archivos de forma independiente. Guarda un resumen y el modelo entrenado localmente."
+    }
+    for q,a in questions.items():
+        with st.expander(q): st.write(a)
+    st.markdown("### Fuente de datos")
+    st.markdown("Bakdi, A., Guichi, A., Mekhilef, S. y Bounoua, W. (2020). [GPVS-Faults: Experimental Data for fault scenarios in grid-connected PV systems under MPPT and IPPT modes](https://data.mendeley.com/datasets/n76t439f65/1). Mendeley Data, V1. DOI: 10.17632/n76t439f65.1. Licencia CC BY 4.0.")
+    st.caption("La aplicación guarda métricas JSON y el modelo supervisado en la carpeta artifacts después de ejecutar la evaluación. Los CSV fuente y transformados se conservan sin sobrescribirlos.")
 
